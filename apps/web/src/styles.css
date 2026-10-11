@@ -1,0 +1,164 @@
+:root {
+  /* Pinned to light: the palette below is a light one, and allowing the UA to
+     switch to dark left near-white default text on hardcoded light surfaces. */
+  color-scheme: light;
+  font-family: system-ui, sans-serif;
+  --text-primary: #1f2933;
+  --text-muted: #4a5568;
+  --surface: #ffffff;
+  --surface-muted: #e7ebf0;
+  --border: #b8c0cc;
+  --accent: #1d4ed8;
+}
+
+body {
+  margin: 0;
+  background: #f4f5f7;
+  color: var(--text-primary);
+}
+
+.app-shell {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 2rem 1rem;
+}
+
+header h1 {
+  margin-bottom: 0.25rem;
+}
+
+.start-call,
+.appointment-form {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 1rem;
+}
+
+.start-call label,
+.appointment-form label {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.chat-window {
+  margin-top: 1.5rem;
+  background: var(--surface);
+  color: var(--text-primary);
+  border-radius: 12px;
+  padding: 1rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.message-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.message-row {
+  display: flex;
+}
+
+.message-row.receptionist {
+  justify-content: flex-start;
+}
+
+.message-row.caller {
+  justify-content: flex-end;
+}
+
+.message-bubble {
+  max-width: 75%;
+  padding: 0.5rem 0.75rem;
+  border-radius: 10px;
+  background: var(--surface-muted);
+  color: var(--text-primary);
+}
+
+.message-row.caller .message-bubble {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.message-tag {
+  display: inline-block;
+  margin-top: 0.35rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.message-sender {
+  display: block;
+  font-size: 0.7rem;
+  font-weight: 600;
+  opacity: 0.85;
+  margin-bottom: 0.15rem;
+}
+
+.message-bubble p {
+  margin: 0;
+}
+
+.message-form,
+.appointment-form {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.message-form input,
+.appointment-form input,
+.start-call input {
+  flex: 1;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-primary);
+}
+
+.message-form input::placeholder,
+.start-call input::placeholder {
+  color: #5b6675;
+  opacity: 1;
+}
+
+.message-form input:disabled,
+.appointment-form input:disabled,
+.start-call input:disabled {
+  background: #eceff3;
+  color: #6b7280;
+  border-color: #cbd2db;
+}
+
+button {
+  padding: 0.5rem 0.9rem;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #ffffff;
+  cursor: pointer;
+}
+
+button:disabled {
+  background: #94a3b8;
+  color: #f8fafc;
+  opacity: 1;
+  cursor: not-allowed;
+}
+
+.error-text {
+  color: #b3261e;
+}
+
+.appointment-status {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}

@@ -1,0 +1,60 @@
+{
+  "name": "@veyra/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "pretest": "node scripts/reset-test-db.mjs",
+    "test": "vitest run",
+    "test:reset": "node scripts/reset-test-db.mjs",
+    "db:reset:dev": "prisma migrate reset",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:test": "tsc -p tsconfig.test.json",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "db:seed": "tsx prisma/seed.ts",
+    "calendar:dev-connect": "tsx scripts/calendar-dev-connect.ts",
+    "subscription:set": "tsx scripts/subscription-set.ts",
+    "notifications:process": "tsx scripts/process-notifications.ts",
+    "worker:probe": "tsx scripts/worker-concurrency-probe.ts",
+    "demo:reset": "tsx scripts/demo-reset.ts",
+    "holds:release": "tsx scripts/release-expired-holds.ts",
+    "entitlement:grant": "tsx scripts/entitlement-grant.ts"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.117.1",
+    "@prisma/client": "^5.19.1",
+    "@veyra/shared": "*",
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "luxon": "^3.7.2",
+    "ws": "^8.21.3",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cookie-parser": "^1.4.10",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/luxon": "^3.7.5",
+    "@types/node": "^20.14.15",
+    "@types/supertest": "^6.0.2",
+    "@types/ws": "^8.18.1",
+    "prisma": "^5.19.1",
+    "supertest": "^7.0.0",
+    "tsx": "^4.16.5",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
+  }
+}

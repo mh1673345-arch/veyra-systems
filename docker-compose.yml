@@ -1,0 +1,36 @@
+# Local development infrastructure for Veyra Reception.
+# This is NOT production hosting: production DATABASE_URL is supplied externally.
+#
+# Uses its own project name, container, port and volume so it never collides
+# with other Postgres containers on this machine (5432/5433 are taken).
+
+name: veyra-reception
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: veyra-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: veyra
+      # Supplied from the repo-root .env (gitignored). No default on purpose.
+      POSTGRES_PASSWORD: ${VEYRA_PG_PASSWORD:?Set VEYRA_PG_PASSWORD in .env}
+      POSTGRES_DB: veyra_dev
+    ports:
+      - "${VEYRA_PG_PORT:-5434}:5432"
+    volumes:
+      - veyra_pgdata:/var/lib/postgresql/data
+      # Creates veyra_test alongside veyra_dev on first initialisation only.
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # -h 127.0.0.1 forces TCP. During first-run init the server only listens on
+      # the unix socket, so this cannot report healthy until the real server is up.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U veyra -d veyra_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  veyra_pgdata:
+    name: veyra_pgdata

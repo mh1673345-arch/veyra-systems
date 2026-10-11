@@ -1,0 +1,11 @@
+{
+  // Typecheck-only config for code outside the production build: tests,
+  // maintenance/probe scripts, the seed and the vitest config. tsconfig.json
+  // (src only, emits dist/) is left untouched.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true
+  },
+  "include": ["src", "tests", "scripts", "prisma/seed.ts", "vitest.config.ts"]
+}

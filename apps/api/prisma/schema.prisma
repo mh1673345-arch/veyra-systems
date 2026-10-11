@@ -1,0 +1,1247 @@
+// Veyra Reception - prototype data model.
+// PostgreSQL everywhere: veyra_dev / veyra_test via docker-compose.yml locally,
+// an externally supplied database in production.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// An authenticated operator. Passwords are only ever stored as a bcrypt hash.
+model User {
+  id                   String                 @id @default(cuid())
+  email                String                 @unique
+  name                 String
+  passwordHash         String
+  disabledAt           DateTime?
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime               @updatedAt
+  memberships          BusinessMembership[]
+  sessions             Session[]
+  statusEvents         StatusEvent[]
+  resetTokens          PasswordResetToken[]
+  authEvents           AuthEvent[]
+  notifications        Notification[]
+  pilotIssuesReported  PilotIssue[]           @relation("PilotIssueReporter")
+  pilotIssuesResolved  PilotIssue[]           @relation("PilotIssueResolver")
+  conversationFeedback ConversationFeedback[] @relation("FeedbackActor")
+  outcomeOverrides     Conversation[]         @relation("ConversationOutcomeActor")
+}
+
+// Access to a business is granted only through an explicit membership.
+// Roles: OWNER | ADMIN | OPERATOR | VIEWER (see services/auth/permissions.ts).
+model BusinessMembership {
+  id         String   @id @default(cuid())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId     String
+  business   Business @relation(fields: [businessId], references: [id])
+  businessId String
+  role       String
+
+  // Personal notification preferences, kept separate from Business capabilities:
+  // a capability answers "may this business send email at all?", a preference
+  // answers "does this operator want this particular email?".
+  // null means "use the default for my role" (operational roles yes, VIEWER no).
+  notifyNewBookingEmail    Boolean?
+  notifyNewEscalationEmail Boolean?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, businessId])
+  @@index([businessId])
+}
+
+// Server-side sessions so a sign-out or a disabled user takes effect
+// immediately. Only the hash of the cookie token is stored.
+model Session {
+  id         String    @id @default(cuid())
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId     String
+  tokenHash  String    @unique
+  // Per-session CSRF token. Checked server-side against the header on unsafe
+  // requests, so a token minted for another session is rejected.
+  csrfToken  String
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  lastUsedAt DateTime  @default(now())
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// Password reset material. Only the hash of the one-time token is stored, and
+// a token is single-use via usedAt. No outbound email is configured, so no
+// user-facing route consumes these yet — see services/auth/passwords.ts.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// Something that happened in the business domain, persisted so it survives a
+// restart and can be processed (or reprocessed) independently of the request
+// that caused it. Emitted by the application layer after a successful mutation
+// — never by the AI responder.
+model DomainEvent {
+  id            String         @id @default(cuid())
+  business      Business       @relation(fields: [businessId], references: [id])
+  businessId    String
+  type          String
+  entityType    String
+  entityId      String
+  // Small, safe metadata for rendering a notification. No conversation
+  // transcripts, no secrets.
+  payload       String         @default("{}")
+  processedAt   DateTime?
+  createdAt     DateTime       @default(now())
+  notifications Notification[]
+
+  @@index([businessId, createdAt])
+  @@index([processedAt])
+}
+
+// A delivery attempt of one event to one recipient over one channel. Separate
+// from the event so a single event can fan out, and so a failed email never
+// calls the underlying booking or escalation into question.
+model Notification {
+  id             String      @id @default(cuid())
+  business       Business    @relation(fields: [businessId], references: [id])
+  businessId     String
+  user           User?       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId         String?
+  // A destination outside the membership, for notifications addressed to
+  // someone who is not a Veyra user. Exactly one of userId, recipientEmail
+  // and recipientPhone is set — enforced by a CHECK constraint in the
+  // migration, so no code path can produce an ambiguous recipient.
+  recipientEmail String?
+  /// E.164 only, for sms and whatsapp. Personal data: masked in the Console.
+  recipientPhone String?
+  /// The provider's own id for the message, so a receipt can find this row.
+  providerMessageId String?
+  // What the provider last said about it: queued | accepted | sent |
+  // delivered | failed | undelivered. Deliberately separate from `status`,
+  // which is Veyra's own delivery-attempt state: a provider accepting a
+  // message is not the same as a handset receiving it, and conflating the two
+  // would let the Console claim a delivery that never happened.
+  deliveryStatus    String?
+  deliveryDetail    String?
+  deliveryUpdatedAt DateTime?
+  event          DomainEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  eventId        String
+  channel        String
+  status         String      @default("pending")
+  subject        String
+  body           String      @default("")
+  // Where this notification points in the dashboard.
+  linkEntity     String?
+  linkEntityId   String?
+  // Which adapter handled it, so "sent" is never ambiguous about what sent it.
+  providerName   String?
+  attemptCount   Int         @default(0)
+  lastAttemptAt  DateTime?
+  nextAttemptAt  DateTime?
+  sentAt         DateTime?
+  failedAt       DateTime?
+  readAt         DateTime?
+  failureReason  String?
+  // Claim lease. claimToken is a random per-claim ownership token: every write
+  // a worker makes after claiming (heartbeat, success, retry, failure, release)
+  // is conditional on it, so a worker that has lost the lease cannot finalize.
+  // leaseExpiresAt is pushed forward by the heartbeat while delivery runs; only
+  // once it has genuinely passed may another worker reclaim the row.
+  // claimedBy/claimedAt are for observability only, never for ownership.
+  claimedAt      DateTime?
+  claimedBy      String?
+  claimToken     String?
+  leaseExpiresAt DateTime?
+  createdAt      DateTime    @default(now())
+
+  // One notification per event, recipient and channel: reprocessing an event
+  // can never produce a duplicate alert. Three constraints rather than one,
+  // because Postgres treats NULLs as distinct in a unique index — so each
+  // guards the rows where its own column is non-null: members, external email
+  // recipients, and phone recipients. The CHECK constraint guarantees exactly
+  // one of the three is always set, so no row escapes all three.
+  @@unique([eventId, userId, channel])
+  @@unique([eventId, recipientEmail, channel])
+  @@unique([eventId, recipientPhone, channel])
+  @@index([providerMessageId])
+  @@index([businessId, userId, readAt])
+  @@index([status, nextAttemptAt, leaseExpiresAt])
+}
+
+// Minimal security audit trail. Never records credentials, raw session tokens
+// or reset tokens.
+model AuthEvent {
+  id        String   @id @default(cuid())
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userId    String?
+  type      String
+  // Coarse context for investigating abuse; no device fingerprinting.
+  ip        String?
+  detail    String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model Business {
+  id              String  @id @default(cuid())
+  name            String
+  description     String  @default("")
+  greeting        String  @default("Thanks for calling, how can I help you today?")
+  hours           String  @default("Mon-Fri 9am-5pm")
+  location        String  @default("")
+  contactPhone    String?
+  contactEmail    String?
+  bookingRules    String  @default("Appointment requests are collected and confirmed by staff; nothing is booked automatically.")
+  escalationRules String  @default("If a caller asks for a real person, or the question can't be answered from the information on file, offer to have a staff member follow up.")
+
+  // Capabilities: what this business can actually do. Everything a channel or
+  // integration would be needed for defaults to false — the assistant must
+  // never offer a capability that isn't switched on here.
+  capBookingRequests    Boolean @default(true)
+  capCalendarBooking    Boolean @default(false)
+  capHumanEscalation    Boolean @default(true)
+  capWhatsapp           Boolean @default(false)
+  capSms                Boolean @default(false)
+  capEmailNotifications Boolean @default(false)
+
+  // --- Scheduling ---
+  // Canonical IANA timezone. Every calendar calculation for this business is
+  // done in this zone — never the server's, the browser's or a developer's.
+  timezone            String @default("UTC")
+  // Booking rules. A slot is bookable only if these allow it AND the calendar
+  // says it is free.
+  minNoticeMinutes    Int    @default(120)
+  maxHorizonDays      Int    @default(60)
+  bufferBeforeMinutes Int    @default(0)
+  bufferAfterMinutes  Int    @default(0)
+  /// Granularity used when proposing alternative slots.
+  slotIntervalMinutes Int    @default(30)
+
+  // --- Profile (self-service) ---
+  // One of the INDUSTRY_TEMPLATES keys in @veyra/shared; only ever used to
+  // *suggest* setup, never to invent facts.
+  industry String  @default("general")
+  website  String?
+
+  // --- Reception status ---
+  // draft: being set up, not answering. active: live. paused: temporarily
+  // answering only with a safe "contact us directly" message.
+  // Self-service workspaces start as draft; existing/internal businesses were
+  // backfilled as active.
+  receptionStatus          ReceptionStatus @default(active)
+  receptionStatusChangedAt DateTime?
+
+  // --- Reception presentation: structured choices only, never free prompts ---
+  assistantName String?
+  receptionTone ReceptionTone @default(professional)
+  closingStyle  ClosingStyle  @default(none)
+
+  // --- Escalation settings ---
+  escalationPhone           String?
+  escalationEmail           String?
+  // Caller-facing text used when Reception can't help (paused, or handoff off).
+  escalationFallbackMessage String?
+
+  // --- Pilot programme (Phase 12) ---
+  // Deliberately separate from the subscription: a business can be on Pro and
+  // in an active pilot, or on Pro with no pilot at all.
+  pilotStatus    PilotStatus @default(none)
+  pilotStartedAt DateTime?
+  pilotEndedAt   DateTime?
+  /// Cohort label, e.g. "dental-q4". Operator-supplied, never inferred.
+  pilotLabel     String?
+  pilotNotes     String?
+
+  // --- Pilot safety controls ---
+  // Operational brakes that sit BELOW entitlements: they can switch something
+  // off for safety, never switch on something the plan does not include.
+  allowAutoBooking      Boolean @default(true)
+  allowAutoReschedule   Boolean @default(true)
+  allowAutoCancellation Boolean @default(true)
+  allowEscalation       Boolean @default(true)
+  allowNotifications    Boolean @default(true)
+
+  createdAt            DateTime               @default(now())
+  conversations        Conversation[]
+  appointments         Appointment[]
+  services             Service[]
+  faqs                 Faq[]
+  escalations          Escalation[]
+  statusEvents         StatusEvent[]
+  memberships          BusinessMembership[]
+  domainEvents         DomainEvent[]
+  notifications        Notification[]
+  businessHours        BusinessHour[]
+  calendarConnections  CalendarConnection[]
+  subscription         Subscription?
+  subscriptionEvents   SubscriptionEvent[]
+  billingCustomer      BillingCustomer?
+  billingCheckouts     BillingCheckout[]
+  voiceSettings        VoiceSettings?
+  messagingSettings    MessagingSettings?
+  entitlementGrants    EntitlementGrant[]
+  customerContacts     CustomerContact[]
+  bookingConfirmations BookingConfirmation[]
+  messagingNumbers     MessagingNumber[]
+  messagingConsents    MessagingConsent[]
+  messageTemplates     MessageTemplate[]
+  callSessions         CallSession[]
+  pilotIssues          PilotIssue[]
+  pilotTarget          PilotTarget?
+  knowledgeGaps        KnowledgeGapSignal[]
+  conversationFeedback ConversationFeedback[]
+}
+
+// Working hours per weekday, in the business timezone. A day with no row is
+// closed; bookable=false keeps a day open for callers but off the calendar.
+model BusinessHour {
+  id           String   @id @default(cuid())
+  business     Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId   String
+  // ISO weekday: 1 = Monday ... 7 = Sunday.
+  dayOfWeek    Int
+  // Minutes from local midnight, e.g. 540 = 09:00.
+  opensMinute  Int
+  closesMinute Int
+  bookable     Boolean  @default(true)
+
+  // Several rows per weekday are allowed: split days such as 09:00-13:00 and
+  // 14:00-18:00. Overlaps are rejected by the settings API.
+  @@index([businessId, dayOfWeek])
+}
+
+// A business's connection to an external calendar. Tokens are encrypted at
+// rest (services/crypto/secretBox.ts) and never leave the server.
+model CalendarConnection {
+  id                   String    @id @default(cuid())
+  business             Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId           String
+  provider             String
+  externalAccountId    String?
+  selectedCalendarId   String?
+  selectedCalendarName String?
+  // Calendar's own timezone as reported by the provider, for display. The
+  // business timezone above stays authoritative for booking rules.
+  timezone             String?
+  scope                String?
+  // Encrypted blobs, never plaintext, never logged, never sent to a client.
+  accessTokenEnc       String?
+  refreshTokenEnc      String?
+  tokenExpiresAt       DateTime?
+  // connected | needs_reauth | disconnected | error
+  status               String    @default("connected")
+  statusDetail         String?
+  connectedByUserId    String?
+  connectedAt          DateTime  @default(now())
+  disconnectedAt       DateTime?
+  lastCheckedAt        DateTime?
+  updatedAt            DateTime  @updatedAt
+
+  @@unique([businessId, provider])
+}
+
+// Short-lived OAuth state. Only the hash of the state parameter is stored, and
+// it is single-use, so a replayed or forged callback is rejected.
+model CalendarOAuthState {
+  id         String    @id @default(cuid())
+  businessId String
+  userId     String
+  provider   String
+  stateHash  String    @unique
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  usedAt     DateTime?
+
+  @@index([expiresAt])
+}
+
+model Service {
+  id              String        @id @default(cuid())
+  business        Business      @relation(fields: [businessId], references: [id])
+  businessId      String
+  name            String
+  description     String        @default("")
+  priceLabel      String        @default("")
+  // How long an appointment for this service takes, used for calendar
+  // availability. Null means "not known" — the service is never offered as a
+  // live calendar slot, it falls back to a booking request for manual review.
+  // Durations are configured per business; nothing here invents one.
+  durationMinutes Int?
+  // Optional qualifier shown with the price ("per session", "from").
+  priceNote       String?
+  // Archived services stay in the database so historical bookings keep their
+  // reference; Reception only ever advertises active ones.
+  active          Boolean       @default(true)
+  // Whether the service can be booked at all (request or calendar).
+  bookable        Boolean       @default(true)
+  sortOrder       Int           @default(0)
+  createdAt       DateTime      @default(now())
+  appointments    Appointment[]
+}
+
+model Faq {
+  id         String   @id @default(cuid())
+  business   Business @relation(fields: [businessId], references: [id])
+  businessId String
+  question   String
+  answer     String
+  category   String?
+  // Disabled FAQs stay stored but are never given to Reception.
+  active     Boolean  @default(true)
+  sortOrder  Int      @default(0)
+  createdAt  DateTime @default(now())
+}
+
+model Conversation {
+  id                    String                 @id @default(cuid())
+  business              Business               @relation(fields: [businessId], references: [id])
+  businessId            String
+  callerName            String?
+  // Which channel this conversation arrived on: web | voice | sms | whatsapp.
+  // One conversation model for every channel — a per-channel table would mean
+  // per-channel history, and the Reception brain reads one history.
+  channel               String                 @default("web")
+  /// How the channel identifies this customer (E.164 for sms/whatsapp), so a
+  /// reply threads onto the conversation it belongs to. Personal data.
+  customerRef           String?
+  // The customer this conversation is with, once one is known. Nullable
+  // because plenty of conversations never give a contact detail at all.
+  customerContact       CustomerContact?       @relation(fields: [customerContactId], references: [id], onDelete: SetNull)
+  customerContactId     String?
+  status                String                 @default("open")
+  createdAt             DateTime               @default(now())
+  // The outcome is normally DERIVED from evidence (bookings, escalations,
+  // message intents) at read time, so analytics can never drift from the
+  // records. Only an operator's explicit correction is stored.
+  // answered | booking_requested | booking_confirmed | escalated |
+  // human_intervention | out_of_scope | abandoned | failed
+  outcomeOverride       String?
+  outcomeOverrideNote   String?
+  outcomeOverrideAt     DateTime?
+  outcomeOverrideUser   User?                  @relation("ConversationOutcomeActor", fields: [outcomeOverrideUserId], references: [id], onDelete: SetNull)
+  outcomeOverrideUserId String?
+  messages              Message[]
+  appointments          Appointment[]
+  escalations           Escalation[]
+  callSessions          CallSession[]
+  pilotIssues           PilotIssue[]
+  feedback              ConversationFeedback[]
+  knowledgeGaps         KnowledgeGapSignal[]
+
+  @@index([businessId, channel, customerRef])
+}
+
+// One customer's contact details, as one business knows them.
+//
+// Scoped to a business on purpose and without exception. The same person may
+// be a customer of two businesses on this server; they are two records, and
+// nothing joins them. A shared customer identity would mean one business's
+// booking history became visible through another's, which is not a feature
+// anybody asked for and is a breach if it happens by accident.
+//
+// This is not a CRM. It holds what is needed to send a confirmation and to
+// recognise a returning customer within one business, and nothing else.
+model CustomerContact {
+  id          String   @id @default(cuid())
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId  String
+  displayName String?
+  /// E.164 only, like everywhere else. Personal data: masked in the Console.
+  phoneE164   String?
+  /// Lowercased and trimmed, so a lookup is an exact match or nothing.
+  email       String?
+  // How far each contact method has actually been proven:
+  // unknown | provided | channel_confirmed | verified.
+  // "provided" means somebody typed it. "channel_confirmed" means the
+  // provider delivered a message from it. Only "verified" means ownership
+  // was proven, and nothing sets it yet because no OTP exists.
+  phoneState  String   @default("unknown")
+  emailState  String   @default("unknown")
+  // Set only alongside the "verified" state, never for the weaker two.
+  phoneVerifiedAt DateTime?
+  emailVerifiedAt DateTime?
+  /// Where this contact first came from: web | voice | sms | whatsapp | operator
+  source      String
+  // Whether Veyra may email this customer about their own booking. There is
+  // no marketing consent here because Veyra sends no marketing; SMS and
+  // WhatsApp consent live in MessagingConsent, keyed by number, because an
+  // opt-out belongs to the number a person actually replied STOP from.
+  emailTransactionalAllowed Boolean @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  conversations Conversation[]
+  appointments  Appointment[]
+  callSessions  CallSession[]
+
+  // Exact match, per business, is what makes resolution deterministic: a
+  // second contact with the same number cannot exist, so "find or create"
+  // has one answer rather than a guess between several.
+  @@unique([businessId, phoneE164])
+  @@unique([businessId, email])
+  @@index([businessId])
+}
+
+// What Veyra decided to tell a customer about one booking transition.
+//
+// A row exists for every transition Veyra considered, including the ones it
+// could not act on: "there was nowhere to send this" is the outcome an
+// operator most needs to see, and a missing row would look identical to a
+// transition that was never processed.
+//
+// The unique key is what makes a repeated domain event harmless. A duplicate
+// booking.confirmed carries a *different* event id, so the Notification
+// indexes cannot catch it; this one can, because it is keyed on the booking
+// and the transition rather than on the event row. transitionKey separates
+// legitimate repeats — a booking rescheduled twice is two confirmations, and
+// the new time tells them apart.
+model BookingConfirmation {
+  id             String      @id @default(cuid())
+  business       Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId     String
+  appointment    Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  appointmentId  String
+  /// confirmed | rescheduled | cancelled
+  transition     String
+  /// Distinguishes repeats of one transition. The new start time for a
+  /// reschedule; empty where a transition can only happen once.
+  transitionKey  String      @default("")
+  /// sms | whatsapp | email, or "none" when nothing was eligible. Never null,
+  /// so the unique key still applies to the no-destination case.
+  channel        String
+  /// Stored in full so a retry reaches the same person; masked for display.
+  recipient      String?
+  /// queued | blocked | no_destination
+  outcome        String
+  /// Why, when it is not queued. Safe to show an operator.
+  reason         String?
+  notificationId String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@unique([appointmentId, transition, transitionKey, channel])
+  @@index([businessId, createdAt])
+  @@index([notificationId])
+}
+
+// An entitlement switched on for one business outside any plan.
+//
+// Only entitlements on ROLLOUT_ENTITLEMENTS may be granted this way, so this
+// can never become a back door to a paid plan feature. Every grant names who
+// made it and why, because "which businesses have this and on whose say-so"
+// is a question that gets asked later.
+model EntitlementGrant {
+  id              String    @id @default(cuid())
+  business        Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId      String
+  entitlement     String
+  reason          String
+  grantedByUserId String?
+  expiresAt       DateTime?
+  revokedAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([businessId, entitlement])
+  @@index([businessId])
+}
+
+// Per-business messaging configuration. Deliberately holds no credentials:
+// which provider to use is a business setting, but the key that talks to it
+// is server configuration, so one tenant's row can never carry a secret.
+model MessagingSettings {
+  id                       String   @id @default(cuid())
+  business                 Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId               String   @unique
+  smsEnabled               Boolean  @default(false)
+  whatsappEnabled          Boolean  @default(false)
+  /// Adapter name, never a credential: fake | twilio | meta | ...
+  smsProvider              String?
+  whatsappProvider         String?
+  /// The sender Veyra messages from, E.164.
+  smsSender                String?
+  whatsappSender           String?
+  /// ISO 3166-1 alpha-2. Used ONLY to reject an ambiguous local number with a
+  /// clear message — never to guess a country onto one.
+  defaultCountry           String?
+  /// Messaging customers at all, as opposed to only the operator team.
+  customerMessagingEnabled Boolean  @default(false)
+  operatorMessagingEnabled Boolean  @default(false)
+  // Transactional booking confirmations, per transition. All default off:
+  // a business starts messaging its customers because someone decided to,
+  // not because they upgraded and nobody noticed.
+  bookingConfirmationEnabled             Boolean @default(false)
+  bookingRescheduleNotificationEnabled   Boolean @default(false)
+  bookingCancellationNotificationEnabled Boolean @default(false)
+  // Which channel a transactional message should prefer:
+  // origin_channel | whatsapp | sms | email | automatic.
+  // A preference is only ever a preference — a channel the business cannot
+  // actually use is skipped rather than attempted.
+  transactionalChannelPreference String @default("origin_channel")
+  // Whether a second eligible channel may be used when the preferred one is
+  // not available. Off by default: one confirmation is the expectation, and
+  // two arriving by different routes reads as a bug to the customer.
+  transactionalFallbackEnabled Boolean @default(false)
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+}
+
+// Inbound routing: which business owns the number a message arrived on.
+// Lookup is always by the number the provider delivered TO, never by the
+// sender — inferring a tenant from a customer's own number would let anyone
+// reach any business from the right handset.
+model MessagingNumber {
+  id               String   @id @default(cuid())
+  business         Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId       String
+  /// sms | whatsapp
+  channel          String
+  provider         String
+  /// The provider's own stable id for this sender, where it has one.
+  providerNumberId String?
+  phoneE164        String
+  createdAt        DateTime @default(now())
+
+  @@unique([channel, provider, phoneE164])
+  @@index([businessId])
+}
+
+// Consent, per channel and per number. A number existing in the database is
+// not consent, so the default is "unknown" and nothing infers permission from
+// the presence of a record. SMS consent never implies WhatsApp consent: they
+// are separate rows on purpose.
+model MessagingConsent {
+  id         String   @id @default(cuid())
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId String
+  /// sms | whatsapp
+  channel    String
+  phoneE164  String
+  /// unknown | granted | revoked
+  state      String   @default("unknown")
+  /// How Veyra learned it: inbound_message | operator | stop_keyword | import
+  source     String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([businessId, channel, phoneE164])
+  @@index([businessId, channel])
+}
+
+// A provider-neutral view of a messaging template. WhatsApp needs an approved
+// template to open a business-initiated conversation; this records that one
+// exists and what it needs, without becoming a content CMS.
+model MessageTemplate {
+  id                 String   @id @default(cuid())
+  business           Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId         String
+  /// Veyra's own key, e.g. booking_confirmation. Stable across providers.
+  key                String
+  /// sms | whatsapp
+  channel            String
+  /// The provider's id for the approved template, once it has one.
+  providerTemplateId String?
+  language           String   @default("en")
+  /// JSON array of variable names, in the order the provider expects them.
+  variables          String   @default("[]")
+  /// draft | pending | approved | rejected | disabled
+  status             String   @default("draft")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([businessId, channel, key, language])
+}
+
+// Messaging webhook idempotency, the same shape as the billing and voice
+// ones: a provider that delivers the same event twice must change nothing the
+// second time.
+model MessagingWebhookEvent {
+  id              String   @id @default(cuid())
+  provider        String
+  externalEventId String
+  /// inbound_message | delivery_receipt
+  type            String
+  /// processed | ignored | duplicate
+  outcome         String
+  detail          String?
+  notificationId  String?
+  businessId      String?
+  eventAt         DateTime
+  processedAt     DateTime @default(now())
+
+  @@unique([provider, externalEventId])
+  @@index([notificationId])
+}
+
+model Message {
+  id                    String                 @id @default(cuid())
+  conversation          Conversation           @relation(fields: [conversationId], references: [id])
+  conversationId        String
+  sender                String
+  text                  String
+  intent                String?
+  action                String?
+  confidence            Float?
+  requiresClarification Boolean                @default(false)
+  // --- Responder outcome (Phase 12), operator-visible only ---
+  // Which responder actually answered, and why the primary one was not used.
+  // Safe by construction: no prompt, no reasoning, no provider payload.
+  // anthropic | rule_based
+  responder             String?
+  // no_api_key | provider_error | provider_timeout | invalid_output |
+  // low_confidence | unsupported_action
+  fallbackReason        String?
+  /// What the action executor actually did with the requested action.
+  actionStatus          String?
+  createdAt             DateTime               @default(now())
+  pilotIssues           PilotIssue[]
+  feedback              ConversationFeedback[]
+  knowledgeGaps         KnowledgeGapSignal[]
+
+  @@index([conversationId, createdAt])
+}
+
+// A booking *request*, not a booking. Lifecycle:
+// draft -> submitted -> reviewing -> confirmed | declined | cancelled.
+// Nothing in this prototype may move a request to "confirmed" automatically —
+// that transition requires a human or a real calendar integration.
+model Appointment {
+  id             String       @id @default(cuid())
+  // The customer this booking is for, when one is known. A reference, not
+  // a copy: correcting a number must not mean editing every past booking.
+  customerContact   CustomerContact? @relation(fields: [customerContactId], references: [id], onDelete: SetNull)
+  customerContactId String?
+  confirmations     BookingConfirmation[]
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  conversationId String
+  business       Business     @relation(fields: [businessId], references: [id])
+  businessId     String
+  requestedTime  String
+  serviceName    String?
+  notes          String?
+  // "request"  — collected for a human to review (the only mode before Phase 8)
+  // "calendar" — checked against a real calendar and confirmed by the caller
+  mode           String       @default("request")
+  status         String       @default("submitted")
+
+  // --- Calendar-backed bookings (null for request-mode) ---
+  service               Service?  @relation(fields: [serviceId], references: [id])
+  serviceId             String?
+  // The instant the appointment starts/ends. Stored UTC; timezone records the
+  // business zone the local time was resolved in.
+  startTime             DateTime?
+  endTime               DateTime?
+  timezone              String?
+  durationMinutes       Int?
+  // Stable application identity for this booking's calendar event. Used as the
+  // provider event id, so retrying a create can never produce a second event.
+  bookingKey            String?   @unique
+  calendarProvider      String?
+  externalCalendarId    String?
+  externalEventId       String?
+  // created | cancelled | unconfirmed (provider outcome was ambiguous)
+  externalEventStatus   String?
+  calendarSyncedAt      DateTime?
+  // A held slot the caller has not confirmed yet expires rather than lingering.
+  confirmationExpiresAt DateTime?
+
+  // --- Proposed reschedule (Phase 12) ---
+  // A caller mentioning a date never moves a booking. Veyra checks the new
+  // time, records the proposal here, and only moves the booking after the
+  // caller explicitly says yes — before this window passes.
+  rescheduleProposedStart   DateTime?
+  rescheduleProposedEnd     DateTime?
+  rescheduleProposalExpires DateTime?
+
+  submittedAt DateTime?
+  reviewedAt  DateTime?
+  resolvedAt  DateTime?
+  confirmedAt DateTime?
+  cancelledAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([businessId, status])
+  @@index([externalEventId])
+}
+
+// Audit trail for human operator transitions. actorUser is the authenticated
+// user who made the change; the name/email are read through the relation
+// rather than copied here.
+model StatusEvent {
+  id          String   @id @default(cuid())
+  business    Business @relation(fields: [businessId], references: [id])
+  businessId  String
+  entityType  String
+  entityId    String
+  fromStatus  String
+  toStatus    String
+  actorType   String   @default("operator")
+  // Audit history outlives the user record: deleting a user nulls the actor
+  // rather than erasing what happened.
+  actorUser   User?    @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  actorUserId String?
+  note        String?
+  createdAt   DateTime @default(now())
+
+  @@index([businessId, entityType, entityId])
+}
+
+// A recorded request for a human to take over. The prototype only records the
+// request — it never fabricates a staff response.
+// Lifecycle: requested -> assigned -> resolved | closed.
+model Escalation {
+  id             String       @id @default(cuid())
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  conversationId String
+  business       Business     @relation(fields: [businessId], references: [id])
+  businessId     String
+  reason         String       @default("")
+  status         String       @default("requested")
+  assignedAt     DateTime?
+  resolvedAt     DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Subscriptions
+//
+// What a business has *paid for*. Plans, entitlements and limits are defined
+// once in @veyra/shared (plans.ts); this table only records which plan a
+// business is on and the state of that subscription. Access decisions are made
+// by services/access/accessService.ts, never by comparing plan codes in routes.
+//
+// Deliberately provider-neutral: a billing provider is an optional external
+// reference, not the shape of the record.
+// ---------------------------------------------------------------------------
+
+enum PlanCode {
+  STARTER
+  PRO
+  MAX
+}
+
+enum SubscriptionStatus {
+  trialing
+  active
+  past_due
+  cancelled
+  expired
+}
+
+model Subscription {
+  id                            String              @id @default(cuid())
+  business                      Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  // One subscription per business; plan changes update it and are audited in
+  // SubscriptionEvent.
+  businessId                    String              @unique
+  plan                          PlanCode
+  status                        SubscriptionStatus
+  startsAt                      DateTime            @default(now())
+  currentPeriodStart            DateTime?
+  currentPeriodEnd              DateTime?
+  trialEndsAt                   DateTime?
+  cancelledAt                   DateTime?
+  // Which billing provider (if any) owns this subscription, and its ids there.
+  // Null until billing is integrated.
+  billingProvider               String?
+  externalBillingCustomerId     String?
+  externalBillingSubscriptionId String?
+  // --- Billing lifecycle, as last confirmed by the provider ---
+  // "month" | "year", from the configured price.
+  billingInterval               String?
+  // The provider will end the paid subscription at currentPeriodEnd.
+  cancelAtPeriodEnd             Boolean             @default(false)
+  // A plan change the provider has scheduled (e.g. a downgrade at period end).
+  scheduledPlan                 PlanCode?
+  scheduledChangeAt             DateTime?
+  // Ordering guard: the creation time of the newest provider event applied.
+  // An older event arriving late can never roll newer state back.
+  lastBillingEventAt            DateTime?
+  createdAt                     DateTime            @default(now())
+  updatedAt                     DateTime            @updatedAt
+  events                        SubscriptionEvent[]
+}
+
+// The business's customer record at the billing provider. One per business,
+// and an external customer can never be attached to two businesses.
+model BillingCustomer {
+  id                 String   @id @default(cuid())
+  business           Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId         String   @unique
+  provider           String
+  externalCustomerId String
+  createdAt          DateTime @default(now())
+
+  @@unique([provider, externalCustomerId])
+}
+
+// A checkout Veyra started. Links the provider's session back to the business
+// and the plan the *server* chose — the webhook never trusts client metadata.
+model BillingCheckout {
+  id                String    @id @default(cuid())
+  business          Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId        String
+  provider          String
+  externalSessionId String
+  targetPlan        PlanCode
+  // open | completed | expired
+  status            String    @default("open")
+  createdByUserId   String?
+  createdAt         DateTime  @default(now())
+  completedAt       DateTime?
+
+  @@unique([provider, externalSessionId])
+  @@index([businessId, createdAt])
+}
+
+// Every provider webhook event Veyra has processed, by the provider's own id.
+// Written in the same transaction as the state change it caused, so a retry of
+// an event that already changed Veyra is recognised and does nothing, and a
+// failed attempt leaves no row behind and can be retried.
+model BillingWebhookEvent {
+  id              String   @id @default(cuid())
+  provider        String
+  externalEventId String
+  type            String
+  // processed | ignored
+  outcome         String
+  // Why an event changed nothing (stale, unknown price, not ours, ...).
+  detail          String?
+  businessId      String?
+  eventCreatedAt  DateTime
+  processedAt     DateTime @default(now())
+
+  @@unique([provider, externalEventId])
+  @@index([businessId, processedAt])
+}
+
+// Audit trail of plan and status changes. Never stores billing-provider
+// payloads: only what changed, when, and who or what changed it.
+model SubscriptionEvent {
+  id               String              @id @default(cuid())
+  business         Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId       String
+  subscription     Subscription        @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  subscriptionId   String
+  previousPlan     PlanCode?
+  newPlan          PlanCode
+  previousStatus   SubscriptionStatus?
+  newStatus        SubscriptionStatus
+  // admin_script | system | billing_provider | migration
+  actorType        String
+  actorUserId      String?
+  reason           String?
+  // The billing provider's event id when a webhook caused this change — a
+  // reference, never the payload.
+  externalEventRef String?
+  createdAt        DateTime            @default(now())
+
+  @@index([businessId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Self-service onboarding
+// ---------------------------------------------------------------------------
+
+enum ReceptionStatus {
+  draft
+  active
+  paused
+}
+
+enum ReceptionTone {
+  professional
+  warm
+  concise
+  premium
+}
+
+enum ClosingStyle {
+  none
+  offer_help
+  thank_you
+}
+
+// Which onboarding steps a workspace has completed or skipped, recorded by
+// the server when a step is saved (after validating it), never by the client.
+model OnboardingProgress {
+  businessId     String    @id
+  completedSteps String[]  @default([])
+  skippedSteps   String[]  @default([])
+  completedAt    DateTime?
+  updatedAt      DateTime  @updatedAt
+}
+
+// Audit trail for configuration changes: who changed what kind of thing, and
+// which fields — never the values, so no contact details or answers are copied.
+model ConfigAuditEvent {
+  id            String   @id @default(cuid())
+  businessId    String
+  actorUserId   String?
+  // workspace | business_profile | service | faq | working_hours |
+  // booking_settings | escalation_settings | reception_settings | reception_status
+  entityType    String
+  entityId      String?
+  // created | updated | archived | restored | disabled | enabled | reordered |
+  // replaced | activated | paused
+  changeType    String
+  changedFields String[] @default([])
+  createdAt     DateTime @default(now())
+
+  @@index([businessId, createdAt])
+}
+
+// ------------------------------------------------------------------
+// Pilot operations (Phase 12)
+// ------------------------------------------------------------------
+
+enum PilotStatus {
+  none
+  preparing
+  active
+  paused
+  completed
+}
+
+/// What an operator reported as wrong, and what happened about it.
+model PilotIssue {
+  id               String        @id @default(cuid())
+  business         Business      @relation(fields: [businessId], references: [id])
+  businessId       String
+  conversation     Conversation? @relation(fields: [conversationId], references: [id])
+  conversationId   String?
+  /// The specific reply being reported, when the operator picked one.
+  message          Message?      @relation(fields: [messageId], references: [id])
+  messageId        String?
+  // incorrect_answer | missing_business_information | wrong_business_information |
+  // bad_tone | booking_issue | escalation_issue | needed_human | other
+  category         String
+  note             String?
+  // open | reviewing | resolved | dismissed
+  status           String        @default("open")
+  resolutionNote   String?
+  reportedBy       User?         @relation("PilotIssueReporter", fields: [reportedByUserId], references: [id], onDelete: SetNull)
+  reportedByUserId String?
+  resolvedBy       User?         @relation("PilotIssueResolver", fields: [resolvedByUserId], references: [id], onDelete: SetNull)
+  resolvedByUserId String?
+  resolvedAt       DateTime?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  @@index([businessId, status, createdAt])
+}
+
+/// An operator's verdict on a reply. Never alters the reply itself.
+model ConversationFeedback {
+  id             String       @id @default(cuid())
+  business       Business     @relation(fields: [businessId], references: [id])
+  businessId     String
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  conversationId String
+  message        Message?     @relation(fields: [messageId], references: [id])
+  messageId      String?
+  // correct | partially_correct | incorrect | needed_human
+  rating         String
+  note           String?
+  actor          User?        @relation("FeedbackActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+  actorUserId    String?
+  createdAt      DateTime     @default(now())
+
+  @@index([businessId, createdAt])
+  @@index([conversationId])
+}
+
+/// Something a caller asked that the business has not told Veyra about.
+/// Derived from known intent/fallback context and a fixed topic vocabulary —
+/// never from free-form model speculation.
+model KnowledgeGapSignal {
+  id             String        @id @default(cuid())
+  business       Business      @relation(fields: [businessId], references: [id])
+  businessId     String
+  conversation   Conversation? @relation(fields: [conversationId], references: [id])
+  conversationId String?
+  message        Message?      @relation(fields: [messageId], references: [id])
+  messageId      String?
+  // missing_service | missing_price | missing_faq | missing_hours |
+  // missing_location | missing_contact | missing_policy | unknown_topic
+  kind           String
+  /// Normalised topic from a fixed vocabulary (e.g. "parking"), or "other".
+  topic          String
+  /// The specific thing, when known — e.g. the service with no price on file.
+  detail         String?
+  createdAt      DateTime      @default(now())
+
+  // One signal per conversation per topic: a caller repeating themselves is
+  // not evidence of a second gap.
+  @@unique([conversationId, kind, topic])
+  @@index([businessId, createdAt])
+}
+
+/// Pilot goals an operator sets. Targets, never promises.
+model PilotTarget {
+  businessId               String   @id
+  business                 Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  targetConversations      Int?
+  targetBookingRequests    Int?
+  targetConfirmedBookings  Int?
+  /// 0..1. Above this, the dashboard warns.
+  maxHumanInterventionRate Float?
+  maxUnresolvedIssues      Int?
+  updatedAt                DateTime @updatedAt
+}
+
+// ------------------------------------------------------------------
+// Voice channel (Phase 13)
+// ------------------------------------------------------------------
+// Voice is a CHANNEL over the same Reception brain, not a second product.
+// Nothing here duplicates services, pricing, calendar rules, escalation,
+// entitlements or audit — a call turns audio into the same structured
+// interaction the text channel already uses.
+
+enum CallDirection {
+  inbound
+  outbound
+}
+
+enum CallStatus {
+  initiated
+  ringing
+  active
+  transferring
+  completed
+  failed
+  missed
+}
+
+/// How a business answers the phone. Provider credentials are NOT here: they
+/// stay in environment configuration, so this row is safe to show an operator.
+model VoiceSettings {
+  businessId          String   @id
+  business            Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  /// The business's own switch. Voice also needs the Max entitlement and a
+  /// healthy provider before a single call is answered.
+  enabled             Boolean  @default(false)
+  // twilio | fake. Null means "whatever the server is configured with".
+  provider            String?
+  /// The number callers dial. Unique, so an inbound call resolves to exactly
+  /// one business or none.
+  businessPhoneNumber String?  @unique
+  /// The number Veyra presents on outbound calls.
+  callerId            String?
+  language            String   @default("en-US")
+  /// Chosen from a fixed list of supported voices — never free text, so voice
+  /// configuration can never become a prompt injection channel.
+  voiceProfile        String   @default("neutral")
+  /// Spoken greeting. Falls back to the business's written greeting.
+  greeting            String?
+  // continue | booking_request | callback | voicemail | handoff
+  afterHoursBehavior  String   @default("continue")
+  /// Where a human transfer goes, when transfers are used at all.
+  handoffNumber       String?
+  voicemailGreeting   String?
+  /// A hard ceiling so a stuck call cannot run forever.
+  maxCallSeconds      Int      @default(600)
+  // disabled | enabled. Off unless a business explicitly turns it on.
+  recordingPolicy     String   @default("disabled")
+  // store | metadata_only. What is kept of what was said.
+  transcriptPolicy    String   @default("store")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+/// One phone call. The conversation, its messages, any booking and any
+/// escalation are the ordinary Veyra records — this only adds what is true of
+/// the call itself.
+model CallSession {
+  id                 String              @id @default(cuid())
+  business           Business            @relation(fields: [businessId], references: [id])
+  businessId         String
+  /// Every answered call gets a Conversation, so the transcript, intents and
+  /// actions live where every other channel's already do.
+  conversation       Conversation?       @relation(fields: [conversationId], references: [id])
+  conversationId     String?
+  provider           String
+  /// The provider's own call id: the deduplication key for its webhooks.
+  externalCallId     String
+  direction          CallDirection
+  status             CallStatus          @default(initiated)
+  /// Personal data. Stored because a callback needs it; never logged.
+  callerNumber       String?
+  // Resolved only when the caller confirmed a number, never from caller ID
+  // alone — an ANI is a hint, and acting on it would hand one person the
+  // history of whoever last used that number.
+  customerContact    CustomerContact?    @relation(fields: [customerContactId], references: [id], onDelete: SetNull)
+  customerContactId  String?
+  businessNumber     String?
+  startedAt          DateTime            @default(now())
+  answeredAt         DateTime?
+  endedAt            DateTime?
+  durationSeconds    Int?
+  // caller_hangup | veyra_hangup | transferred | failed | timeout | no_answer
+  hangupReason       String?
+  handoffOccurred    Boolean             @default(false)
+  /// Only set when the business has recording switched on. A reference, never audio.
+  recordingReference String?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  turns              CallTurn[]
+  webhookEvents      VoiceWebhookEvent[]
+
+  @@unique([provider, externalCallId])
+  @@index([businessId, startedAt])
+}
+
+/// One exchange in a call, with where its time went. Used to see whether Veyra
+/// answers fast enough to feel like a receptionist.
+model CallTurn {
+  id            String      @id @default(cuid())
+  callSession   CallSession @relation(fields: [callSessionId], references: [id], onDelete: Cascade)
+  callSessionId String
+  /// The Veyra reply this turn produced, when there was one.
+  messageId     String?
+  sttMs         Int?
+  responderMs   Int?
+  actionMs      Int?
+  ttsMs         Int?
+  totalMs       Int?
+  /// True when the caller spoke over Veyra and the reply was cut short.
+  interrupted   Boolean     @default(false)
+  createdAt     DateTime    @default(now())
+
+  @@index([callSessionId, createdAt])
+}
+
+/// Provider call events, recorded so a retried webhook changes Veyra once.
+model VoiceWebhookEvent {
+  id              String       @id @default(cuid())
+  provider        String
+  externalEventId String
+  type            String
+  // processed | ignored | duplicate
+  outcome         String
+  detail          String?
+  callSession     CallSession? @relation(fields: [callSessionId], references: [id])
+  callSessionId   String?
+  businessId      String?
+  eventAt         DateTime
+  processedAt     DateTime     @default(now())
+
+  @@unique([provider, externalEventId])
+  @@index([callSessionId])
+}
